@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# buildozer / 打包中间产物
+.buildozer/
+bin/
+build/
+dist/
+*.apk
+*.aab
+
+# 生成的中文字体子集例外：tools/subset_font.py 生成、verify_font.py 验证过的
+# fonts/NotoSansSC-Regular.ttf 是要提交进仓库的（~200KB），构建期不再联网下载
+!fonts/NotoSansSC-Regular.ttf
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

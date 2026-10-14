@@ -1,0 +1,82 @@
+# 卡五星 —— 安卓 APK 云打包（腾讯 CNB 云原生构建）
+#
+# 为什么用 CNB：国内直连、微信扫码登录、免费额度足够；不需要 GitHub、不需要加速工具。
+# 触发：推送到 main / master 分支。
+# 产物：APK 作为构建附件，在流水线页面点击下载（保留 90 天）。
+#
+# v2 改进（之前最容易失败的三处全修了）：
+#   1. 中文字体已作为 fonts/NotoSansSC-Regular.ttf（~200KB）提交在仓库里，
+#      由 tools/subset_font.py 从本机字体生成、GDI+ 渲染验证 —— 构建期不再联网下载字体；
+#   2. pip 走清华镜像，buildozer 的 python 依赖不会在 pypi.org 上超时；
+#   3. gradle 走腾讯云镜像（安卓构建工具链下载提速、避免被墙）。
+
+main:
+  push:
+    - name: 打包卡五星 APK
+      docker:
+        image: kivy/buildozer:latest
+        volumes:
+          # SDK / NDK / gradle 缓存：第二次构建从 30 分钟降到几分钟
+          - /home/user/.buildozer
+          - /home/user/.gradle
+      env:
+        - PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+        - GRADLE_PLUGIN_MAVEN_CENTRAL=https://maven.aliyun.com/repository/central
+      stages:
+        - name: 检查输入
+          script: |
+            echo "==> 工作目录: $(pwd)"
+            ls -la
+            test -f buildozer.spec || { echo "[X] buildozer.spec 不在仓库根目录"; exit 1; }
+            test -f fonts/NotoSansSC-Regular.ttf || { echo "[X] fonts/NotoSansSC-Regular.ttf 缺失（应在仓库里）"; exit 1; }
+            test -f main.py || { echo "[X] main.py 缺失"; exit 1; }
+            echo "[OK] 字体 $(stat -c%s fonts/NotoSansSC-Regular.ttf) 字节，源码齐备"
+
+        - name: 编译 APK
+          script: |
+            set -e
+            export PATH="$HOME/.local/bin:$PATH"
+            export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+            # buildozer 官方镜像自带 entrypoint（会切目录 + 降权），CNB 里直接调用可能不生效，
+            # 所以这里做三路兼容
+            if command -v buildozer >/dev/null 2>&1; then
+              BZ="buildozer"
+              echo "==> 直接使用镜像内的 buildozer"
+            elif [ -x /usr/local/bin/entrypoint.sh ]; then
+              BZ="/usr/local/bin/entrypoint.sh buildozer"
+              echo "==> 使用镜像 entrypoint 调用 buildozer"
+            else
+              echo "==> 镜像内没有 buildozer，现场安装（走清华镜像）"
+              pip3 install --user --upgrade buildozer 'cython<3'
+              BZ="buildozer"
+            fi
+
+            echo "---- 开始编译（首次约 20-40 分钟）----"
+            $BZ -v android debug 2>&1 | tail -120
+            echo "---- 产物 ----"
+            ls -la bin/ || true
+            ls bin/*.apk >/dev/null 2>&1 || { echo "[X] 没有产出 APK，编译失败"; exit 1; }
+
+        - name: 收集 APK
+          script: |
+            set -e
+            mkdir -p /space/dist
+            cp -v bin/*.apk /space/dist/
+            ls -la /space/dist/
+
+        - name: 上传 APK 作为构建附件
+          image: cnbcool/attachments:latest
+          settings:
+            attachments:
+              - "/space/dist/*.apk"
+            ttl: 90
+          exports:
+            FILES: FILES
+
+        - name: 打印下载地址
+          script: |
+            echo "=============================================="
+            echo " APK 附件已上传：$FILES"
+            echo " 在本流水线页面点「附件」即可下载安装到手机。"
+            echo "=============================================="
