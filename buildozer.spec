@@ -29,7 +29,17 @@ presplash.filename = presplash.png
 # 依赖：纯 Python3 + Kivy（规则引擎零第三方依赖）
 # 不锁 Kivy 小版本：python-for-android 对「不指定版本」的组合测过最多，
 # 锁 kivy==2.3.0 反而可能和 p4a 内置的 Python 版本对不上。
-requirements = python3,kivy
+#
+# charset-normalizer 必须锁 <3.5：
+#   kivy -> Kivy-Garden -> requests -> charset-normalizer 是纯 Python 传递依赖，
+#   3.5.0 起该包开始发布 android 专用轮子（...-cp3xx-cp3xx-android_24_arm64_v8a.whl）。
+#   p4a 先用 `pip --platform=android_24_arm64_v8a --only-binary=:all:` 探测出这个
+#   android 轮子并把「直链 URL」写进 requirements.txt，随后真正安装时是不带
+#   --platform 的本机 pip，于是报
+#   "charset_normalizer-3.5.2-...-android_24_arm64_v8a.whl is not a supported wheel
+#    on this platform" 而整轮构建失败（2026-10-14 两次失败都是这个原因）。
+#   3.4.9 及以前只有 py3-none-any 通用轮子，探测与安装都能通过。
+requirements = python3,kivy,charset-normalizer==3.4.9
 
 # 只编 arm64（2019 年以后的安卓手机基本都是），打包快一倍；
 # 要兼容很老的手机改成 arm64-v8a,armeabi-v7a
