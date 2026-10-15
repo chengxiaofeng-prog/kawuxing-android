@@ -14,6 +14,14 @@ dist/
 # 本地校验用的第三方纯 Python 库（PyYAML），不进仓库
 tools/_pylib/
 
+# 本机诊断 / 推送辅助脚本与临时输出（只在本地用，不推送）
+tools/*.ps1
+tools/aaa.bat
+tools/_diag*.txt
+tools/_ref*.txt
+tools/_timeline.txt
+tools/_joblog.txt
+
 # 编辑器 / 系统
 .vscode/
 .idea/

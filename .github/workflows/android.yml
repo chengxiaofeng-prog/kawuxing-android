@@ -1,19 +1,30 @@
 name: Build Android APK
 
-# ── 维护笔记（2026-10-14 那次失败的原因）──────────────────────────────
-# 上一版用的是第三方 Action `ArtemSBulgakov/buildozer-action@v1`，它自带的
-# Dockerfile 里有 `add-apt-repository ppa:openjdk-r/ppa` 然后 `apt update`，
-# 而它的基础镜像 ghcr.io/kivy/buildozer 已经升到 Ubuntu 26.04（resolute），
-# 该 PPA 没有 resolute 的 Release 文件 → 404 → apt 退出码 100 → 镜像构建失败
-# → 整个 job 在跑到任何 step 之前就挂了（日志里能看到 "Docker build failed"）。
-# 所以本文件 **不再使用任何第三方打包 Action**。
+# ── 维护笔记 ────────────────────────────────────────────────────────────
+# 历史失败与根因（均已在下方修掉）：
 #
-# 方案A（首选）：直接用官方镜像的文档标准用法
-#     docker run -v "$PWD":/home/user/hostcwd kivy/buildozer:latest android debug
-#   镜像内已装好 JDK 17 + autoconf/automake/libltdl-dev/ccache/cmake/unzip 等
-#   全部依赖，runner 上一个 apt 包都不用装，环境与镜像完全解耦。
-# 方案B（兜底）：万一容器路线挂了，就在 runner 上现装 buildozer 直接编译，
-#   并复用方案A已经下好的 Android SDK / NDK。
+# ① 用第三方 Action `ArtemSBulgakov/buildozer-action@v1` 打包 → 失败。
+#    该 Action 自带 Dockerfile 里执行 add-apt-repository ppa:openjdk-r/ppa
+#    再 apt update；而它基于的 ghcr.io/kivy/buildozer 已经升到
+#    Ubuntu 26.04（resolute），该 PPA 没有 resolute 的 Release 文件 →
+#    404 → apt 退出码 100 → 镜像构建失败，job 在任何 step 之前就挂。
+#    → 本文件不再使用任何第三方打包 Action，直接用官方镜像 docker run。
+#
+# ② p4a 安装纯 Python 依赖时失败，报
+#      charset_normalizer-3.5.2-cp314-cp314-android_24_arm64_v8a.whl
+#      is not a supported wheel on this platform
+#    根因：kivy recipe 的 python_depends 带出 requests → charset-normalizer。
+#    p4a 先在「安卓平台」下用 pip --dry-run 解析，挑中了安卓专用轮子并把它的
+#    直链写进 requirements.txt；而随后真正安装那条命令不带 --platform，
+#    pip 用宿主机标签判断，直接拒绝该轮子。
+#    → 用 pip 约束文件把 charset-normalizer 钉到 3.4.9（该版本只发通用轮子），
+#      约束写入 /etc/pip.conf（pip 全局配置），不依赖环境变量传递。
+#      详见仓库根目录 pip-constraints.txt 的说明。
+#
+# 方案A（首选）：官方镜像 docker run，镜像内已装 JDK17 +
+#   autoconf/automake/libltdl-dev/ccache/cmake 等全部依赖，runner 一个 apt 包都不装。
+# 方案B（兜底）：万一容器路线挂了，在 runner 上现装 buildozer 直接编译，
+#   复用方案A已经下好的 Android SDK / NDK。
 #
 # 中文字体（fonts/NotoSansSC-Regular.ttf，~200KB）已提交进仓库，
 # 由 tools/subset_font.py 生成、GDI+ 逐字渲染验证过 —— 构建期不联网下载字体。
@@ -42,12 +53,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          for f in main.py buildozer.spec icon.png presplash.png fonts/NotoSansSC-Regular.ttf; do
+          for f in main.py buildozer.spec icon.png presplash.png \
+                   fonts/NotoSansSC-Regular.ttf pip-constraints.txt; do
             test -f "$f" || { echo "::error::缺少文件 $f"; exit 1; }
           done
           echo "字体 $(stat -c%s fonts/NotoSansSC-Regular.ttf) 字节"
           grep -n '^requirements' buildozer.spec
-          grep -n 'accept_sdk_license' buildozer.spec
+          echo "--- pip 约束（钉住 charset-normalizer，避开安卓专用轮子） ---"
+          grep -v '^#' pip-constraints.txt | grep -v '^$'
 
       # buildozer 要下 SDK + NDK + gradle 缓存，约 8-10GB
       - name: 释放磁盘空间
@@ -61,19 +74,22 @@ jobs:
       # 只缓存「下载缓存」和 gradle 缓存 —— 都是幂等的，坏了也不会污染编译。
       # 注意：刻意不缓存 android-sdk / android-ndk（一旦存进半截的解压目录，
       # p4a 会以为 NDK 已就绪而跳过解压，后面链接必然失败）。
-      # 怀疑缓存脏了就把 key 里的 bz1 递增一位。
+      # 怀疑缓存脏了就把 key 里的 bz2 递增一位。
       - name: 缓存下载
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer/cache
             ~/.gradle
-          key: bz1-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: bz2-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'pip-constraints.txt') }}
 
       - name: 拉取构建镜像
         run: docker pull kivy/buildozer:latest
 
       # ── 方案A：官方 Docker 镜像 ─────────────────────────────────────
+      # 用 --entrypoint /bin/bash 先写入 /etc/pip.conf（pip 的全局配置，
+      # 无论容器内哪个用户、哪个 venv 都读得到），再交回官方 entrypoint
+      # 执行 buildozer —— 这样既不破坏镜像的 UID 映射逻辑，又保证约束一定生效。
       - name: 打包 APK · 方案A（首次约 30-50 分钟）
         id: buildA
         continue-on-error: true
@@ -82,10 +98,20 @@ jobs:
           set -o pipefail
           docker run --rm \
             -e PYTHONFORANDROID_PREREQUISITES_INSTALL_INTERACTIVE=0 \
+            -e PIP_CONSTRAINT=/home/user/hostcwd/pip-constraints.txt \
             -v "$GITHUB_WORKSPACE":/home/user/hostcwd \
             -v "$HOME/.buildozer":/home/user/.buildozer \
             -v "$HOME/.gradle":/home/user/.gradle \
-            kivy/buildozer:latest android debug 2>&1 | tee build-a.log
+            --entrypoint /bin/bash \
+            kivy/buildozer:latest -c '
+              set -e
+              echo "=== 写入 pip 全局约束（修 charset-normalizer 安卓轮子问题） ==="
+              printf "[global]\nconstraint = /home/user/hostcwd/pip-constraints.txt\n" > /etc/pip.conf
+              cat /etc/pip.conf
+              cat /home/user/hostcwd/pip-constraints.txt
+              echo "=== 交给官方 entrypoint 执行 buildozer ==="
+              exec /usr/local/bin/entrypoint.sh android debug
+            ' 2>&1 | tee build-a.log
           echo "=== 方案A 日志末尾 ==="
           tail -30 build-a.log
 
@@ -134,6 +160,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # 同样的 pip 约束，装到 runner 的 pip 全局配置里
+          printf '[global]\nconstraint = %s/pip-constraints.txt\n' "$GITHUB_WORKSPACE" \
+            | sudo tee /etc/pip.conf >/dev/null
+          export PIP_CONSTRAINT="$GITHUB_WORKSPACE/pip-constraints.txt"
+          cat /etc/pip.conf
           buildozer -v android debug 2>&1 | tee build-b.log
           echo "=== 方案B 日志末尾 ==="
           tail -30 build-b.log

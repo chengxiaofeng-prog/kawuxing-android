@@ -1,0 +1,25 @@
+# pip 约束文件 —— 修 p4a 安装“纯 Python 依赖”时的安卓轮子问题
+#
+# 背景（2026-10-14 构建失败的根因）：
+#   kivy 的 recipe 声明了 python_depends = certifi, chardet, idna, requests,
+#   urllib3, filetype；requests 又带出 charset-normalizer 和 six。
+#   p4a 会用 `pip install --dry-run --only-binary=:all: --platform=android_24_arm64_v8a
+#   --python-version 3.14.2 --report ...` 在“安卓平台”下解析这些依赖，
+#   pip 会优先挑「安卓专用轮子」，于是把
+#       charset_normalizer-3.5.2-cp314-cp314-android_24_arm64_v8a.whl
+#   的直链写进了 requirements.txt；
+#   可紧接着真正安装的那条命令是
+#       venv/bin/pip install -v --target ... --no-deps -r requirements.txt
+#   它**不带 --platform**，pip 用宿主机（linux x86_64）的标签去判断，
+#   于是报 "is not a supported wheel on this platform" 整轮失败。
+#
+#   为什么只有 charset-normalizer 中招：p4a 的 process_python_modules() 里判断
+#   是否跳过某个包时用 `mname.lower().replace("-", "_")`，而待比对的名字集合用的是
+#   带连字符的原名，两者不一致——所以只有「名字带连字符」的包会被塞进直链，
+#   其余（certifi/chardet/idna/requests/urllib3/filetype/six）都走通用轮子，正常。
+#
+# 修法：用 pip 官方的约束文件（constraints）钉死版本。
+#   charset-normalizer 只有 3.5.0 及以上才发布安卓专用轮子；
+#   3.4.9 及以前只发 py3-none-any 通用轮子，任何平台都能安装。
+#   约束通过 /etc/pip.conf（pip 全局配置，不依赖环境变量传递）生效。
+charset-normalizer==3.4.9

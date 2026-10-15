@@ -30,13 +30,26 @@ main:
             test -f buildozer.spec || { echo "[X] buildozer.spec 不在仓库根目录"; exit 1; }
             test -f fonts/NotoSansSC-Regular.ttf || { echo "[X] fonts/NotoSansSC-Regular.ttf 缺失（应在仓库里）"; exit 1; }
             test -f main.py || { echo "[X] main.py 缺失"; exit 1; }
+            test -f pip-constraints.txt || { echo "[X] pip-constraints.txt 缺失（修 charset-normalizer 安卓轮子用的约束文件）"; exit 1; }
             echo "[OK] 字体 $(stat -c%s fonts/NotoSansSC-Regular.ttf) 字节，源码齐备"
+            grep -v '^#' pip-constraints.txt | grep -v '^$'
 
         - name: 编译 APK
           script: |
             set -e
             export PATH="$HOME/.local/bin:$PATH"
             export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+            # pip 全局约束：p4a 在安卓平台下解析纯 Python 依赖时会挑中
+            # charset-normalizer 的「安卓专用轮子」，而真正安装那条命令不带
+            # --platform，pip 会拒绝该轮子导致整轮失败。钉到 3.4.9（只有通用轮子）。
+            if [ "$(id -u)" = "0" ]; then
+              printf '[global]\nconstraint = %s/pip-constraints.txt\n' "$(pwd)" > /etc/pip.conf
+              echo "==> 已写入 /etc/pip.conf:"; cat /etc/pip.conf
+            else
+              echo "==> 非 root，改用 PIP_CONSTRAINT 环境变量（entrypoint 用 sudo --preserve-env 传递）"
+            fi
+            export PIP_CONSTRAINT="$(pwd)/pip-constraints.txt"
 
             # buildozer 官方镜像自带 entrypoint（会切目录 + 降权），CNB 里直接调用可能不生效，
             # 所以这里做三路兼容
