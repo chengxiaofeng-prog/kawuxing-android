@@ -19,9 +19,59 @@
     · 右上角「重开」随时重开一局。
 """
 
+import datetime
 import os
 import random
 import sys
+
+
+def _redirect_output_to_file():
+    """
+    把 stdout / stderr 重定向到「手机上能直接打开的位置」。
+
+    安卓上如果启动阶段就抛异常，进程会立即退出，屏幕上什么都看不到
+    （表现就是"一打开就闪退"）。重定向之后，崩溃时的 traceback 会落到
+    文件里，便于排查。正常游戏不受影响。
+
+    用 os.dup2 换的是文件描述符本身，所以连 Kivy / SDL 这些 C 层
+    直接写 fd 2 的输出也能一并捕获。
+    """
+    candidates = [
+        "/storage/emulated/0/Android/data/org.kawuxing/files/boot.log",
+        "/sdcard/Android/data/org.kawuxing/files/boot.log",
+        "/storage/emulated/0/Download/kawuxing_boot.log",
+        "/sdcard/kawuxing_boot.log",
+    ]
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here:
+            candidates.append(os.path.join(here, "boot.log"))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            parent = os.path.dirname(path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.close(fd)
+            return path
+        except Exception:
+            continue
+    return None
+
+
+_BOOT_LOG = _redirect_output_to_file()
+print("=== KaWuXing boot %s ===" % datetime.datetime.now())
+print("python  :", sys.version.replace("\n", " "))
+print("platform:", sys.platform)
+print("log file:", _BOOT_LOG)
+try:
+    sys.stdout.flush()
+except Exception:
+    pass
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -1000,5 +1050,25 @@ class KaWuXingApp(App):
 
 
 if __name__ == "__main__":
-    Window.size = (1280, 720)
-    KaWuXingApp().run()
+    # 只在桌面调试时指定窗口尺寸；安卓上屏幕尺寸由设备决定，
+    # 强制设置反而可能在部分机型上引发窗口初始化异常。
+    try:
+        from kivy.utils import platform as _kivy_platform
+    except Exception:
+        _kivy_platform = ""
+    if _kivy_platform != "android":
+        Window.size = (1280, 720)
+
+    # 兜住启动期的任何异常：把 traceback 写进 boot.log（见文件顶部的重定向），
+    # 而不是让进程静默退出 —— 否则手机上只能看到一个"闪退"。
+    try:
+        KaWuXingApp().run()
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise
