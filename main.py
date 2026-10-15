@@ -353,7 +353,7 @@ class Board(Widget):
         self.buttons.append((W - bw - 10 * k, H - bh - 8 * k, bw, bh, "重开", "restart"))
 
     def _draw_opponents(self, W, H, k):
-        eng = self.engine
+        eng = self.app.engine
         for seat in (1, 2):
             left = (seat == 1)
             p = eng.players[seat]
@@ -400,7 +400,7 @@ class Board(Widget):
 
     def _draw_discards(self, W, H, k):
         """两家的弃牌：左家画在左列，右家画在右列。"""
-        eng = self.engine
+        eng = self.app.engine
         tw, th = 30 * k, 42 * k
         cols = 3
         for seat in (1, 2):
