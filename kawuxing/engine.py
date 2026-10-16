@@ -22,6 +22,32 @@ from .rules import (
 SEAT_COUNT = 3
 
 
+# ---------------------------------------------------------------------------
+# 亮倒（亮出全部手牌，本局输赢 ×2）的公共判定
+#
+# 规则口径（用户确认）：
+#   · 亮倒只发生在「自己进张之后、出牌之前」这一个窗口 —— 自己摸牌（含杠后补摸）、
+#     碰牌、庄家起手 14 张都算；别人回合、自己已经出完牌（结构位 13）都不算。
+#   · 亮倒必须「先亮倒、后出牌」，且打出的那张之后**手牌必须仍然听头**；
+#     找不到这样的牌就不许亮倒。
+# ---------------------------------------------------------------------------
+
+def keeps_ting(engine, seat, tile):
+    """打出 tile 之后，该家手牌是否仍然听牌（亮倒后的出牌约束靠它把关）。"""
+    p = engine.players[seat]
+    if tile not in p.hand:
+        return False
+    rest = list(p.hand)
+    rest.remove(tile)
+    return is_ting(rest, len(p.melds))
+
+
+def ting_keep_discards(engine, seat):
+    """所有「打出去之后仍然听牌」的牌（去重、升序）。空列表 = 不能亮倒。"""
+    p = engine.players[seat]
+    return [t for t in sorted(set(p.hand)) if keeps_ting(engine, seat, t)]
+
+
 class GameEngine(object):
     def __init__(self, rules=None, seed=0):
         self.rules = rules if rules is not None else RuleConfig()
@@ -523,9 +549,19 @@ class SimpleAi(object):
         if not p.hand:
             return -1
 
-        # 亮倒之后手牌锁死，只能把刚摸到的牌打出去
+        # 亮倒之后手牌锁死：优先打刚摸到的那张（打了它一定回到原来的听牌形态）；
+        # 碰后/起手没有「刚摸到的牌」，或者打它居然不听牌时，
+        # 退化成「挑一张打了仍然听牌的」—— 绝不返回一个不在手里的脏值。
         if p.liang_dao:
-            return engine.last_drawn_tile
+            t = engine.last_drawn_tile
+            if t in p.hand and keeps_ting(engine, seat, t):
+                return t
+            keeps = ting_keep_discards(engine, seat)
+            if keeps:
+                return keeps[0]
+            if t in p.hand:
+                return t
+            return p.hand[0]
 
         visible = engine.visible_counts(seat)
         candidates = self._distinct(p.hand)

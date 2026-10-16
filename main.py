@@ -224,7 +224,10 @@ from kawuxing.rules import (                       # noqa: E402
     MeldType, ClaimType, ClaimOption, RuleConfig, tile_name,
     winning_tiles, is_ting, is_number, rank_of, suit_of,
 )
-from kawuxing.engine import GameEngine, SimpleAi, SEAT_COUNT   # noqa: E402
+from kawuxing.engine import (                      # noqa: E402
+    GameEngine, SimpleAi, SEAT_COUNT,
+    keeps_ting, ting_keep_discards,
+)
 
 HUMAN = 0
 SEAT_LABEL = {0: "你", 1: "左家", 2: "右家"}
@@ -772,6 +775,10 @@ class Board(Widget):
             tips.append("已亮倒 ×2" + ("（托管中）" if app.human_auto else ""))
         if tips:
             draw_text(self, W * 0.5, 178 * k, "　".join(tips), 18 * k, GOLD)
+        # 亮倒中、还没出牌：把「能打哪几张」直接写出来（点别的牌打不出去）
+        if p.liang_dao and app.wait_discard and not app.human_auto:
+            draw_text(self, W * 0.5, 200 * k,
+                      "亮倒中 · 只能打：%s" % app._liang_keep_text(), 18 * k, GOLD)
         # 听牌推演面板
         if app.inspect is not None:
             self._draw_ting(W, H, k, app.inspect)
@@ -1112,6 +1119,9 @@ class KaWuXingApp(App):
             for kk in (1, 2):
                 other = (seat + kk) % SEAT_COUNT
                 opts = eng.get_claim_options(other, tile, seat, gang_shang_pao)
+                # 亮倒的人不能碰：碰会拆散已经听牌的手牌，亮倒就失去意义
+                #（电脑托管和玩家手动走同一条过滤，口径一致）
+                opts = self._auto_claim_options(other, opts)
                 if not opts:
                     continue
                 if self._is_auto(other):
@@ -1209,13 +1219,22 @@ class KaWuXingApp(App):
 
     def _ask_human_discard(self):
         self.wait_discard = True
-        self.message = "轮到你了 · 点牌选中，再点一次打出"
+        if self.engine.players[HUMAN].liang_dao:
+            self.message = "亮倒中 · 只能打出打了仍能听头的牌"
+        else:
+            self.message = "轮到你了 · 点牌选中，再点一次打出"
         self.board.redraw()
-        while self.wait_discard and self.pending_discard < 0:
+        # 等待途中可能点了「亮倒」或「托管」：那两个都不改 pending_discard，
+        # 所以循环必须同时盯着 human_auto，否则会一直等一张永不出现的牌。
+        while (self.wait_discard and self.pending_discard < 0
+               and not self._is_auto(HUMAN)):
             yield 0.05
         tile = self.pending_discard
         self.pending_discard = -1
         self.wait_discard = False
+        if tile < 0 and self._is_auto(HUMAN):
+            # 转托管：交给电脑挑一张（亮倒时优先打刚摸到的）
+            return self.ai[HUMAN].choose_discard(self.engine, HUMAN)
         return tile
 
     def _settle(self):
@@ -1258,16 +1277,31 @@ class KaWuXingApp(App):
     # ----------------------------------------------------------------
 
     def _can_liang_dao(self):
+        """
+        亮倒时机：**只有「自己进张之后、还没出牌」这一个窗口**。
+
+        · 自己摸牌后（含杠后补摸）、碰牌后、庄家起手 14 张 —— 都是「待出牌」，
+          结构位 14，只要有一张打出去之后仍然听头就能亮倒；
+        · 别人回合、自己已经出完牌（结构位 13）—— 不能亮倒
+          （早期版本这时也亮着按钮，等于「不打牌就能亮倒」，是 bug）。
+        """
         eng = self.engine
         p = eng.players[HUMAN]
-        if eng.round_over or p.liang_dao:
+        if eng.round_over or p.liang_dao or not eng.rules.allow_liang_dao:
             return False
-        slots = structural_slots(p)
-        if slots == 13:
-            return eng.is_ting(HUMAN)
-        if slots == 14:
-            return self._ting_keep_discard() >= 0
-        return False
+        if not self.wait_discard:                  # 必须轮到自己出牌
+            return False
+        if structural_slots(p) != 14:              # 必须已经进张、手里多一张
+            return False
+        return self._ting_keep_discard() >= 0      # 打了还得仍能听头
+
+    def _liang_keep_text(self):
+        """「亮倒中可打」的牌面文字，用于提示。"""
+        eng = self.engine
+        keeps = ting_keep_discards(eng, HUMAN)
+        if not keeps:
+            return "（无）"
+        return " ".join(tile_name(t) for t in keeps)
 
     def _ting_keep_discard(self):
         eng = self.engine
@@ -1284,17 +1318,22 @@ class KaWuXingApp(App):
         return best
 
     def do_liang_dao(self):
+        """
+        亮倒：手牌摊开、本局输赢 ×2。
+
+        注意时序 —— **先亮倒、后出牌**：亮倒只是把状态置位，接下来那张牌仍然
+        由玩家自己点（只能点「打了仍能听头」的），出牌后才真正进入听牌形态。
+        不再自动托管，想交给电脑就点「托管」。
+        """
         eng = self.engine
         p = eng.players[HUMAN]
         if not self._can_liang_dao():
             return
         p.liang_dao = True
-        self.human_auto = True
-        if structural_slots(p) == 14:
-            t = self._ting_keep_discard()
-            if t >= 0:
-                self.discard_override = t
-        self.message = "你亮倒了（×2）· 机器自动打牌"
+        self.human_auto = False
+        self.inspect = None
+        self.selected = -1
+        self.message = "你亮倒了（×2）· 只能打：%s" % self._liang_keep_text()
         self.board.redraw()
 
     # ----------------------------------------------------------------
@@ -1318,16 +1357,21 @@ class KaWuXingApp(App):
         p = eng.players[HUMAN]
         if self.result is not None or self.claim_options:
             return
-        if p.liang_dao and not self.human_auto:
-            pass
-        if p.liang_dao:
-            return                          # 亮倒后手牌锁死（托管由电脑打）
+        if p.liang_dao and self.human_auto:
+            return                          # 亮倒 + 托管：牌由电脑打，点牌无效
         if not self.wait_discard:
             # 没轮到出牌时点牌 = 只看推演
             self.inspect = tile if self.inspect != tile else None
             self.board.redraw()
             return
         if self.selected == idx:
+            # 亮倒中：只有「打了之后手牌仍然听头」的牌才打得出去
+            if p.liang_dao and not keeps_ting(eng, HUMAN, tile):
+                self.selected = -1
+                self.inspect = None
+                self.message = "亮倒中 · 只能打：%s" % self._liang_keep_text()
+                self.board.redraw()
+                return
             self.pending_discard = tile
             self.selected = -1
             self.inspect = None
