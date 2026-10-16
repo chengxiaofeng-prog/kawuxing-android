@@ -20,26 +20,67 @@
 """
 
 import datetime
+import faulthandler
 import os
 import random
 import sys
 import time
 
 
+_prev_tail = []          # 上一轮异常退出时留下的日志尾巴
+_RUN_FLAG = "running.flag"
+
+
+def _flag_path():
+    try:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), _RUN_FLAG)
+    except Exception:
+        return None
+
+
+def _clear_run_flag():
+    """正常退出时删掉标记 —— 它还在，就说明上一轮没走完（多半是原生崩溃）。"""
+    p = _flag_path()
+    if not p:
+        return
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+# 判断"上一轮到底崩没崩"的关键字（faulthandler / SDL 的输出特征）
+_CRASH_MARKERS = (
+    "Fatal Python error", "Current thread", "Stack (most recent call first)",
+    "SIGSEGV", "SIGABRT", "SIGBUS", "SIGILL", "SIGFPE",
+    "signal 11", "signal 6", "signal 7", "signal 4", "signal 8",
+    "Backtrace", "backtrace",
+)
+
+
 def _redirect_output_to_file():
     """
-    把 stdout / stderr 重定向到「手机上能直接打开的位置」。
+    把 stdout / stderr 重定向到「用数据线连电脑后能直接打开的位置」。
 
-    安卓上如果启动阶段就抛异常，进程会立即退出，屏幕上什么都看不到
-    （表现就是"一打开就闪退"）。重定向之后，崩溃时的 traceback 会落到
-    文件里，便于排查。正常游戏不受影响。
+    安卓上如果崩在原生层（GPU 驱动 / SDL），进程会立即退出，屏幕上什么都看不到
+    （表现就是"一打开就闪退"）。重定向之后，崩溃时写往 fd 1/2 的内容
+    （含 faulthandler 的信号栈、Kivy/SDL 的 C 层输出）都会落到文件里。
 
-    用 os.dup2 换的是文件描述符本身，所以连 Kivy / SDL 这些 C 层
-    直接写 fd 2 的输出也能一并捕获。
+    路径用真实包名：package.domain = org.kawuxing, package.name = kawuxing
+    → 应用包名是 org.kawuxing.kawuxing（写错包名的目录会被 Scoped Storage 拒绝）。
+    Android/data/<包名>/files 不需要任何权限，且 MTP(数据线) 下电脑可见。
     """
     candidates = [
+        # ★ 首选：Android/media/<包名>/ —— Android 11+ 起 data/ 目录被系统对
+        #   文件管理器隐藏，但 media/ 不隐藏：手机自带的「文件管理」能直接看到，
+        #   不用连电脑、不用 adb，直接把这个文件发出来即可。
+        "/storage/emulated/0/Android/media/org.kawuxing.kawuxing/boot.log",
+        "/sdcard/Android/media/org.kawuxing.kawuxing/boot.log",
+        # 次选：应用自己的外部目录（数据线连电脑 / MTP 可见）
+        "/storage/emulated/0/Android/data/org.kawuxing.kawuxing/files/boot.log",
+        "/sdcard/Android/data/org.kawuxing.kawuxing/files/boot.log",
         "/storage/emulated/0/Android/data/org.kawuxing/files/boot.log",
-        "/sdcard/Android/data/org.kawuxing/files/boot.log",
         "/storage/emulated/0/Download/kawuxing_boot.log",
         "/sdcard/kawuxing_boot.log",
     ]
@@ -54,10 +95,27 @@ def _redirect_output_to_file():
             parent = os.path.dirname(path)
             if parent and not os.path.isdir(parent):
                 os.makedirs(parent)
+            # ★ 上一轮若是异常退出（flag 还在），先把旧日志尾巴存下来 ——
+            #   本轮会清空文件，之后再想读就没了。
+            flag = _flag_path()
+            if flag and os.path.exists(flag) and os.path.exists(path):
+                try:
+                    with open(path, "r", errors="replace") as f:
+                        _prev_tail.extend(l.rstrip("\n")
+                                          for l in f.readlines()[-120:])
+                except Exception:
+                    pass
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             os.close(fd)
+            # 标记"本轮运行中"；正常退出时会在 App.on_stop 里删掉它。
+            if flag:
+                try:
+                    with open(flag, "w") as f:
+                        f.write("1")
+                except Exception:
+                    pass
             return path
         except Exception:
             continue
@@ -69,10 +127,86 @@ print("=== KaWuXing boot %s ===" % datetime.datetime.now())
 print("python  :", sys.version.replace("\n", " "))
 print("platform:", sys.platform)
 print("log file:", _BOOT_LOG)
+
+# ★ 关键：捕获原生层崩溃（SIGSEGV/SIGABRT/SIGBUS…）。
+#   GPU 驱动（如部分 Adreno）崩掉时，Python 的 try/except 完全抓不到，
+#   进程直接消失 —— 表现就是"一打开就闪退"。faulthandler 会在进程被信号
+#   杀死前，把所有线程的 Python 调用栈写进 stderr（已被重定向到 boot.log），
+#   于是即使没有电脑、没有 adb，也能知道崩在哪一行。
+try:
+    faulthandler.enable()          # 默认写 stderr -> 已 dup2 到 boot.log
+except Exception:
+    pass
+
 try:
     sys.stdout.flush()
 except Exception:
     pass
+
+
+def _trace(msg):
+    """分步追踪：崩溃时文件里最后一行就是"最后一个成功走完的步骤"。"""
+    try:
+        print("[T] %s" % msg)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _log_env_info():
+    """
+    把 GPU / 机型 / 安卓版本写进 boot.log。
+
+    这一条是排查"某台设备才崩"的核心线索：GPU 驱动（尤其部分 Adreno）
+    上 Kivy 的着色器会把驱动直接打崩，崩在 native 层，Python 抓不到 —— 
+    只有 GL_VENDOR / GL_RENDERER 能证明机器用的是不是那类驱动。
+    """
+    info = []
+    try:
+        from kivy.core.window import Window
+        info.append(("gl_backend", str(Window.gl_backend)))
+    except Exception:
+        pass
+    try:
+        from kivy.graphics import cgl            # Kivy 2.x：GL 函数入口
+        get = getattr(cgl, "glGetString", None)
+        if get is not None:
+            for key, enum in (("GL_VENDOR", 0x1F00), ("GL_RENDERER", 0x1F01),
+                              ("GL_VERSION", 0x1F02)):
+                try:
+                    v = get(enum)
+                    if isinstance(v, bytes):
+                        v = v.decode("utf-8", "replace")
+                    info.append((key, str(v)))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        from kivy.utils import platform as _kp
+        info.append(("platform", str(_kp)))
+        info.append(("sdk_version", str(sys.getandroidapilevel())
+                     if hasattr(sys, "getandroidapilevel") else "-"))
+    except Exception:
+        pass
+    try:
+        from jnius import autoclass
+        Build = autoclass("android.os.Build")
+        info.append(("device", "%s %s" % (Build.MANUFACTURER, Build.MODEL)))
+        info.append(("android", str(Build.VERSION.RELEASE)))
+        info.append(("sdk_int", str(Build.VERSION.SDK_INT)))
+        info.append(("cpu_abi", " ".join(Build.SUPPORTED_ABIS)))
+    except Exception:
+        pass
+    if info:
+        try:
+            # 一行一个字段：报告页按行显示，长行不会被截断
+            for k, v in info:
+                print("[ENV] %s=%s" % (k, v))
+            sys.stdout.flush()
+        except Exception:
+            pass
+
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -132,13 +266,23 @@ FACE_FILES[18] = "zhong"
 FACE_FILES[19] = "fa"
 FACE_FILES[20] = "bai"
 
-_tex_cache = {}                       # name -> CoreImage 或 None（None 也缓存）
+_tex_cache = {}                       # name -> CoreImage（成功才缓存）
+_tex_fail = {}                        # name -> 上次失败的 monotonic 时间
 
 
 def load_tex(name):
-    """加载 textures/<name>.jpg；缺失/损坏返回 None。首次绘制时懒加载。"""
+    """
+    加载 textures/<name>.jpg；缺失/损坏返回 None。
+
+    注意：App 刚启动、GL 上下文还没就绪的那零点几秒里，纹理加载可能
+    瞬时失败 —— 失败不能永久缓存（否则这一局永远没贴图），隔 1.5 秒
+    要允许重试；成功的照常缓存。
+    """
     if name in _tex_cache:
         return _tex_cache[name]
+    now = time.monotonic() if hasattr(time, "monotonic") else time.time()
+    if now - _tex_fail.get(name, -9.0) < 1.5:
+        return None                    # 刚失败过，先等等再重试
     path = os.path.join(_TEX_DIR, name + ".jpg")
     img = None
     if os.path.exists(path):
@@ -146,7 +290,10 @@ def load_tex(name):
             img = CoreImage(path)
         except Exception:
             img = None
-    _tex_cache[name] = img
+    if img is not None:
+        _tex_cache[name] = img
+    else:
+        _tex_fail[name] = now
     return img
 
 
@@ -392,12 +539,21 @@ class Board(Widget):
     # ----------------------------------------------------------------
 
     def redraw(self, *_a):
+        _trace("redraw size=%.0fx%.0f started=%s" % (
+            self.width, self.height, self.app.started))
         self.canvas.clear()
         self.hand_rects = []
         self.buttons = []
         app = self.app
+        # ★ 上一轮是异常退出（原生崩溃）→ 直接摆出「崩溃现场」页，
+        #   用户不用连电脑、不用 adb，拍张照就能把原因发出来。
+        if getattr(app, "crash_report", None):
+            self._draw_crash_report(app.crash_report)
+            _trace("  crash-report ok")
+            return
         if not app.started:
             self._draw_title()
+            _trace("  title ok")
             return
         W, H, k = self._metrics()
         cv = self
@@ -411,11 +567,17 @@ class Board(Widget):
             cv.canvas.add(Color(*FELT_DARK))
             cv.canvas.add(Rectangle(pos=(0, H * 0.62), size=(W, H * 0.38)))
 
+        _trace("  bg ok")
         self._draw_topbar(W, H, k)
+        _trace("  topbar ok")
         self._draw_opponents(W, H, k)
+        _trace("  opponents ok")
         self._draw_discards(W, H, k)
+        _trace("  discards ok")
         self._draw_hand(W, H, k)
+        _trace("  hand ok")
         self._draw_info(W, H, k)
+        _trace("  info ok")
 
     def _draw_title(self):
         W, H, k = self._metrics()
@@ -428,6 +590,64 @@ class Board(Widget):
             self.canvas.add(Rectangle(pos=(0, 0), size=(W, H)))
         draw_text(self, W / 2.0, H * 0.60, "卡五星", H * 0.16, GOLD)
         draw_text(self, W / 2.0, H * 0.44, "正在准备牌局 ……", H * 0.05, DIM)
+
+    def _draw_crash_report(self, lines):
+        """
+        「崩溃现场」页：上一次运行没走完（flag 还在），就把那份日志的末尾直接
+        铺在屏幕上 —— 拍张照即可，不需要数据线、不需要 adb、不需要找文件。
+        """
+        W, H, k = self._metrics()
+        self.canvas.add(Color(0.08, 0.09, 0.11, 1))
+        self.canvas.add(Rectangle(pos=(0, 0), size=(W, H)))
+
+        blob = "\n".join(lines)
+        if any(m in blob for m in _CRASH_MARKERS):
+            verdict, vcol = "★ 检测到原生崩溃信号（faulthandler 已抓到调用栈）", \
+                (1.0, 0.45, 0.34, 1)
+        elif "Traceback (most recent call last)" in blob:
+            verdict, vcol = "★ 检测到 Python 异常（见下方 Traceback）", \
+                (1.0, 0.72, 0.30, 1)
+        else:
+            verdict, vcol = "未检测到崩溃信号（也可能是被系统回收，可直接开始游戏）", DIM
+
+        draw_text(self, W * 0.5, H - 30 * k, "上次运行没有正常结束", 27 * k,
+                  (1.0, 0.45, 0.34, 1))
+        draw_text(self, W * 0.5, H - 56 * k, verdict, 16 * k, vcol)
+        draw_text(self, W * 0.5, H - 78 * k,
+                  "日志已存到 Android/media/org.kawuxing.kawuxing/boot.log，"
+                  "拍照或把该文件发出来即可定位原因", 14 * k, DIM)
+
+        # 只显示有效行；按屏宽裁剪长度，避免长行跑出屏幕
+        fs = 13 * k
+        maxchars = max(40, min(200, int((W - 40 * k) / (fs * 0.56))))
+        rows = []
+        for ln in lines:
+            ln = ln.replace("\t", "    ").rstrip()
+            if not ln:
+                continue
+            if len(ln) > maxchars:
+                ln = ln[:maxchars] + "…"
+            rows.append(ln)
+        top = H - 100 * k
+        step = 17 * k
+        max_rows = max(5, int((top - 64 * k) / step))
+        if len(rows) > max_rows:
+            keep_head = 1
+            tail_n = max_rows - keep_head - 1
+            rows = rows[:keep_head] + \
+                ["……（省略 %d 行）" % (len(rows) - keep_head - tail_n)] + \
+                rows[-tail_n:]
+        y = top
+        for ln in rows:
+            draw_text(self, 18 * k, y, ln, fs, (0.86, 0.89, 0.86, 1), anchor="l")
+            y -= step
+            if y < 58 * k:
+                break
+
+        bw, bh = 300 * k, 44 * k
+        bx = W * 0.5 - bw / 2.0
+        rounded_btn(self, bx, 12 * k, bw, bh, "知道了，开始游戏", 20 * k)
+        self.buttons.append((bx, 12 * k, bw, bh, "知道了，开始游戏", "crashclear"))
 
     def _draw_topbar(self, W, H, k):
         app = self.app
@@ -609,15 +829,30 @@ class KaWuXingApp(App):
     title = "KaWuXing"
 
     def build(self):
-        _init_sounds()
-        self.board = Board(self)
+        _log_env_info()
+        # ★ 上一轮没走完（原生崩溃）→ 先摆「崩溃现场」页，用户看完再开局。
+        self.crash_report = list(_prev_tail) if _prev_tail else None
         self.started = False
         self.engine = None
         self.ai = None
         self._gen = None
         self._reset_state()
-        Clock.schedule_once(lambda dt: self.start_game(), 0.3)
+        _init_sounds()
+        self.board = Board(self)
+        if self.crash_report:
+            print("[CRASH-REPORT] showing %d lines from previous run"
+                  % len(self.crash_report))
+            Clock.schedule_once(lambda dt: self.board.redraw(), 0)
+        else:
+            Clock.schedule_once(lambda dt: self.start_game(), 0.3)
         return self.board
+
+    # ----------------------------------------------------------------
+    # 生命周期：正常退出要摘掉 running.flag，否则下次会被误判成崩溃
+    # ----------------------------------------------------------------
+
+    def on_stop(self):
+        _clear_run_flag()
 
     # ----------------------------------------------------------------
     # 状态
@@ -647,6 +882,7 @@ class KaWuXingApp(App):
         self._rng = random.Random()
 
     def start_game(self, *_a):
+        _trace("start_game")
         self._reset_state()
         self.engine = GameEngine(seed=self._rng.randrange(1 << 30))
         self.ai = {s: SimpleAi(seed=self._rng.randrange(1 << 30))
@@ -741,6 +977,7 @@ class KaWuXingApp(App):
         self.pending_choice = None
 
         eng.start_round(self.dealer, self.round_index)
+        _trace("round %d start, dealer=%d" % (self.round_index, self.dealer))
         self.message = "第 %d 局 · %s 坐庄" % (self.round_index, SEAT_LABEL[self.dealer])
         self.board.redraw()
         yield 0.5
@@ -857,6 +1094,7 @@ class KaWuXingApp(App):
                 eng.declare_draw()
                 return
             eng.try_discard(seat, tile)
+            _trace("discard seat=%d tile=%s" % (seat, tile_name(tile)))
             sfx("discard")
             if seat == HUMAN:
                 self.human_drawn = -1
@@ -981,6 +1219,7 @@ class KaWuXingApp(App):
         return tile
 
     def _settle(self):
+        _trace("settle")
         eng = self.engine
         hu = eng.last_hu
         deltas = [eng.players[s].score - self.score_before[s]
@@ -1099,6 +1338,11 @@ class KaWuXingApp(App):
 
     def _on_button(self, value):
         eng = self.engine
+        if value == "crashclear":
+            # 崩溃现场看完了 → 收起报告页，正常开一局
+            self.crash_report = None
+            self.start_game()
+            return
         if value == "restart":
             self.pending_choice = None
             self.claim_options = []
