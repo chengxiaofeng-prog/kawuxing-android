@@ -577,6 +577,7 @@ class Board(Widget):
         _trace("  opponents ok")
         self._draw_discards(W, H, k)
         _trace("  discards ok")
+        self._draw_human_discards(W, H, k)
         self._draw_hand(W, H, k)
         _trace("  hand ok")
         self._draw_info(W, H, k)
@@ -713,57 +714,140 @@ class Board(Widget):
                 txt = " ".join(tile_name(t) for t in p.hand)
                 draw_text(self, tx, my - 60 * k, txt, 16 * k, DIM, anchor=anchor)
 
+    def _tile_unit(self, W, H, k):
+        """底部一组牌的统一「牌宽」：手牌按 1.5 倍目标放大，装不下就收到刚好铺满。
+
+        三重封顶（与桌面版 `unit = min(BASE_UNIT * TILE_SCALE, (W-150)/slots)` 同一思路）：
+          ① 用户要求的 1.5 倍目标；
+          ② 屏幕宽度要放得下「手牌 + 副露」整行；
+          ③ 自己的牌河要能摆下两行同样大小的牌（牌河与手牌同尺寸）。
+        """
+        app = self.app
+        p = app.engine.players[HUMAN]
+        n = len(p.hand)
+        drawn = 1 if (app.human_drawn >= 0 and app.human_drawn in p.hand) else 0
+        slots = n * 1.025 + drawn * 0.18          # 手牌占位（含摸到那张多出的缝）
+        for m in p.melds:                          # 副露：0.8 倍宽 + 组间缝
+            cnt = 3 if m.type == MeldType.PENG else m.tile_count
+            slots += cnt * 0.83 + 0.10
+        uw = min(64 * k * 1.5, W * 0.985 / max(slots, 1.0))
+        avail_v = (H * 0.72 - 8 * k) - 244 * k     # 牌河两行的可用高度
+        uw = min(uw, (avail_v - 10 * k - 4) / 2.812)   # 2 行 + 行距（1.406 = 牌高宽比）
+        uw = max(40 * k, uw)
+        return uw, uw * 1.406
+
     def _draw_discards(self, W, H, k):
-        """两家的弃牌：左家画在左列，右家画在右列。"""
+        """两家的弃牌：左家一列、右家一列，各 4 张一行往下码。
+
+        牌张跟着手牌的放大比例一起放大（比例上限 1.5 倍）；
+        放不下的早牌收起、标「+N」；最新打出的那张加金框。
+        """
         eng = self.app.engine
-        tw, th = 30 * k, 42 * k
-        cols = 3
+        uw, _uh = self._tile_unit(W, H, k)
+        s = min(1.5, uw / (64.0 * k))
+        tw, th = 30 * k * s, 42 * k * s
+        per = 4                                    # 每行 4 张，窄条给中间让出地方
+        step = th + 5 * k
+        y0 = H * 0.56                              # 第一行（最早打出的）
+        rows = max(2, int((y0 - 168 * k) / step) + 1)
         for seat in (1, 2):
             left = (seat == 1)
             d = eng.players[seat].discards
-            per = 7
+            newest = len(d) - 1 if eng.last_discard_seat == seat else -1
             for i, t in enumerate(d):
                 row, col = divmod(i, per)
+                if row >= rows:
+                    break
                 if left:
                     x = W * 0.03 + col * (tw + 4 * k)
                 else:
                     x = W - W * 0.03 - (col + 1) * (tw + 4 * k)
-                y = H * 0.52 - row * (th + 5 * k)
+                y = y0 - row * step
                 draw_tile(self, x, y, tw, th, t)
-        # 刚打出的那张，牌河中央金框高亮
-        if eng.last_discard_tile >= 0 and not eng.round_over:
-            lw, lh = 44 * k, 62 * k
-            lx, ly = W * 0.5 - lw / 2.0, H * 0.46
-            draw_tile(self, lx, ly, lw, lh, eng.last_discard_tile)
-            self.canvas.add(Color(*GOLD))
-            self.canvas.add(Line(rounded_rectangle=(lx - 2, ly - 2, lw + 4, lh + 4, 6),
-                                 width=2.2))
+                if i == newest:
+                    self.canvas.add(Color(*GOLD))
+                    self.canvas.add(Line(rounded_rectangle=(
+                        x - 1.5, y - 1.5, tw + 3, th + 3, 5), width=2.0))
+            over = len(d) - rows * per
+            if over > 0:
+                last_row = (min(len(d), rows * per) - 1) // per
+                tx = (W * 0.03 + per * (tw + 4 * k) + 6 * k) if left else \
+                     (W - W * 0.03 - per * (tw + 4 * k) - 6 * k)
+                draw_text(self, tx, y0 - last_row * step + th * 0.5,
+                          "+%d" % over, 15 * k, DIM,
+                          anchor=("l" if left else "r"))
+
+    def _draw_human_discards(self, W, H, k):
+        """自己的弃牌：**和手牌同尺寸**（与桌面版同一口径：牌河里的牌与手牌同尺寸）。
+
+        之前只画左右两家的牌河，自己打出去的牌在桌面上根本看不到；
+        现在摆在自己手牌上方，最新的一张加金框，放不下的早牌收起并标「+N」。
+        """
+        eng = self.app.engine
+        d = eng.players[HUMAN].discards
+        if not d:
+            return
+        uw, uh = self._tile_unit(W, H, k)
+        gap = uw * 0.025
+        # 左右两边要留给对家的牌河（各 4 张宽），中间才是自己的
+        opp_w = 4 * (30 * k * min(1.5, uw / (64.0 * k)) + 4 * k)
+        span = (W - W * 0.06 - 2 * opp_w - 16 * k)
+        per = max(4, int(span / (uw + gap)))
+        rows = max(1, min(2, int(((H * 0.72 - 8 * k) - 244 * k) / (uh + 5 * k))))
+        total_w = per * (uw + gap)
+        bx = W * 0.5 - total_w / 2.0
+        newest = len(d) - 1 if eng.last_discard_seat == HUMAN else -1
+        for i, t in enumerate(d):
+            r, c = divmod(i, per)
+            if r >= rows:
+                break
+            x = bx + c * (uw + gap)
+            y = 244 * k + r * (uh + 5 * k)       # 最早的牌在最下面，往上码
+            draw_tile(self, x, y, uw, uh, t)
+            if i == newest:                      # 自己刚打的那张金框
+                self.canvas.add(Color(*GOLD))
+                self.canvas.add(Line(rounded_rectangle=(
+                    x - 2, y - 2, uw + 4, uh + 4, 7), width=2.4))
+        over = len(d) - rows * per               # 放不下的早牌收起，标个数
+        if over > 0:
+            draw_text(self, W * 0.5, 244 * k + rows * (uh + 5 * k) + 14 * k,
+                      "+%d 张更早的已收起" % over, 15 * k, DIM)
 
     def _draw_hand(self, W, H, k):
         app = self.app
         eng = app.engine
         p = eng.players[HUMAN]
-        tw, th = 64 * k, 90 * k
-        gap = 3 * k
+        tw, th = self._tile_unit(W, H, k)        # 1.5 倍目标 + 宽度自适应
+        gap = tw * 0.025
         n = len(p.hand)
-        if n == 0:
-            return
+        # 副露（碰/杠）排在左手边，比手牌小一号（与桌面版 0.8 倍一致）
+        mw, mh = tw * 0.80, th * 0.80
+        mgap = tw * 0.03
+        groups = [3 if m.type == MeldType.PENG else m.tile_count for m in p.melds]
+        melds_w = sum(c * (mw + mgap) + tw * 0.10 for c in groups)
         drawn = -1
         order = list(range(n))
         if app.human_drawn >= 0 and app.human_drawn in p.hand:
             drawn = p.hand.index(app.human_drawn)
             order = [i for i in range(n) if i != drawn] + [drawn]
-        total = n * (tw + gap) + (14 * k if drawn >= 0 else 0)
-        x = W * 0.5 - total / 2.0
-        y = 12 * k
+        hand_w = n * (tw + gap) + (tw * 0.18 if drawn >= 0 else 0)
+        x = W * 0.5 - (melds_w + hand_w) / 2.0
+        y = 10 * k
+        mx = x
+        for m, cnt in zip(p.melds, groups):
+            for _i in range(cnt):
+                draw_tile(self, mx, y + (th - mh) / 2.0, mw, mh, m.tile)
+                mx += mw + mgap
+            mx += tw * 0.10
+        x += melds_w
         for idx in order:
             is_drawn = (idx == drawn)
             sel = (idx == app.selected)
             xx = x
-            yy = y + 16 * k if sel else y
+            yy = y + tw * 0.25 if sel else y
             draw_tile(self, xx, yy, tw, th, p.hand[idx], selected=sel)
             self.hand_rects.append((xx, yy, tw, th, p.hand[idx], idx))
-            x += tw + gap + (14 * k if is_drawn else 0)
+            x += tw + gap + (tw * 0.18 if is_drawn else 0)
 
     def _draw_info(self, W, H, k):
         app = self.app
@@ -774,16 +858,16 @@ class Board(Widget):
         if p.liang_dao:
             tips.append("已亮倒 ×2" + ("（托管中）" if app.human_auto else ""))
         if tips:
-            draw_text(self, W * 0.5, 178 * k, "　".join(tips), 18 * k, GOLD)
+            draw_text(self, W * 0.5, 186 * k, "　".join(tips), 18 * k, GOLD)
         # 亮倒中、还没出牌：把「能打哪几张」直接写出来（点别的牌打不出去）
         if p.liang_dao and app.wait_discard and not app.human_auto:
-            draw_text(self, W * 0.5, 200 * k,
+            draw_text(self, W * 0.5, 208 * k,
                       "亮倒中 · 只能打：%s" % app._liang_keep_text(), 18 * k, GOLD)
         # 听牌推演面板
         if app.inspect is not None:
             self._draw_ting(W, H, k, app.inspect)
         # 底部按钮
-        bx, by = W * 0.5, 118 * k
+        bx, by = W * 0.5, 128 * k
         bw, bh = 108 * k, 46 * k
         gap = 14 * k
         for label, value, fill in app.button_row():
@@ -801,7 +885,7 @@ class Board(Widget):
         if tile in rest:
             rest.remove(tile)
         if not is_ting(rest, len(p.melds)):
-            draw_text(self, W * 0.5, 205 * k,
+            draw_text(self, W * 0.5, 230 * k,
                       "打 %s：不听牌" % tile_name(tile), 19 * k, DIM)
             return
         outs = eng.outs_left(HUMAN, rest, {tile: 1})
@@ -810,7 +894,7 @@ class Board(Widget):
             n = outs[t]
             parts.append("%s 剩%d" % (tile_name(t), n) if n else
                          "%s 已绝张" % tile_name(t))
-        draw_text(self, W * 0.5, 212 * k,
+        draw_text(self, W * 0.5, 230 * k,
                   "打 %s 听：%s" % (tile_name(tile), "　".join(parts)),
                   18 * k, DIM)
 
