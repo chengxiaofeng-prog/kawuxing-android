@@ -23,6 +23,7 @@ import datetime
 import os
 import random
 import sys
+import time
 
 
 def _redirect_output_to_file():
@@ -75,6 +76,8 @@ except Exception:
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.audio import SoundLoader
+from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
 from kivy.graphics import Color, Ellipse, Line, Rectangle
@@ -113,6 +116,71 @@ BTN = (0.16, 0.34, 0.27, 1)
 BTN_EDGE = (0.45, 0.62, 0.50, 1)
 DIM = (0.78, 0.82, 0.78, 1)
 HU_RED = (0.62, 0.10, 0.08, 1)
+
+# ---------------------------------------------------------------- 外部资源
+# 与桌面版同源：textures/ 下的 JPG 替换「牌面图案 / 牌背 / 桌面」，缺哪个文件
+# 就回退到程序内画的图案；sounds/ 下的 WAV 为出牌/碰/杠/胡音效，缺了就静音。
+_TEX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "textures")
+_SND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+
+FACE_FILES = {}                       # tile 索引 -> 文件名（不含扩展名）
+for _i in range(9):
+    FACE_FILES[_i] = "tong%d" % (_i + 1)
+for _i in range(9):
+    FACE_FILES[9 + _i] = "tiao%d" % (_i + 1)
+FACE_FILES[18] = "zhong"
+FACE_FILES[19] = "fa"
+FACE_FILES[20] = "bai"
+
+_tex_cache = {}                       # name -> CoreImage 或 None（None 也缓存）
+
+
+def load_tex(name):
+    """加载 textures/<name>.jpg；缺失/损坏返回 None。首次绘制时懒加载。"""
+    if name in _tex_cache:
+        return _tex_cache[name]
+    path = os.path.join(_TEX_DIR, name + ".jpg")
+    img = None
+    if os.path.exists(path):
+        try:
+            img = CoreImage(path)
+        except Exception:
+            img = None
+    _tex_cache[name] = img
+    return img
+
+
+_sounds = {}                          # name -> Sound 或 None
+_last_sfx = {}
+
+
+def _init_sounds():
+    """App.build() 时调用一次：把 sounds/ 下的 WAV 装进 SDL2_mixer。"""
+    for name in ("discard", "peng", "gang", "hu"):
+        path = os.path.join(_SND_DIR, name + ".wav")
+        s = None
+        if os.path.exists(path):
+            try:
+                s = SoundLoader.load(path)
+            except Exception:
+                s = None
+        _sounds[name] = s
+
+
+def sfx(name):
+    """异步播放音效；同一音效 50ms 内不重复触发（防连点爆音）。"""
+    s = _sounds.get(name)
+    if s is None:
+        return
+    now = time.time()
+    if now - _last_sfx.get(name, 0.0) < 0.05:
+        return
+    _last_sfx[name] = now
+    try:
+        s.play()
+    except Exception:
+        pass
+
 
 _FONT = None
 
@@ -200,13 +268,24 @@ _HONOR_TEXT = {ZHONG: "中", FA: "发", BAI: "白"}
 
 
 def draw_tile(cv, x, y, w, h, tile, back=False, selected=False, dim=False):
-    """画一张牌（x,y = 左下角）。"""
+    """画一张牌（x,y = 左下角）。textures/ 里有对应 JPG 就贴图，否则程序画。"""
     col = BACK if back else FACE
     edge = BACK_EDGE if back else FACE_EDGE
     if dim:
         col = (col[0] * 0.75, col[1] * 0.75, col[2] * 0.75, 1)
     cv.canvas.add(Color(*col))
     cv.canvas.add(Rectangle(pos=(x, y), size=(w, h)))
+
+    # 外部贴图层（整张贴进牌面，白坯色块兜底；JPG 的直角由下面的圆角线收边）
+    tex = None
+    if back:
+        tex = load_tex("tile_back")
+    else:
+        name = FACE_FILES.get(tile)
+        tex = load_tex(name) if name else None
+    if tex is not None:
+        cv.canvas.add(Rectangle(texture=tex.texture, pos=(x, y), size=(w, h)))
+
     cv.canvas.add(Color(*edge))
     cv.canvas.add(Line(rounded_rectangle=(x + 0.5, y + 0.5, w - 1, h - 1, 6),
                        width=1.4))
@@ -215,12 +294,15 @@ def draw_tile(cv, x, y, w, h, tile, back=False, selected=False, dim=False):
         cv.canvas.add(Line(rounded_rectangle=(x - 1, y - 1, w + 2, h + 2, 7),
                            width=2.6))
     if back:
-        # 牌背中央的竹纹小方块
-        cv.canvas.add(Color(0.30, 0.32, 0.72, 1))
-        bw, bh = w * 0.52, h * 0.40
-        bx, by = x + (w - bw) / 2.0, y + (h - bh) / 2.0
-        cv.canvas.add(Line(rounded_rectangle=(bx, by, bw, bh, 4), width=1.2))
+        if tex is None:
+            # 无贴图时才程序画：牌背中央的竹纹小方块
+            cv.canvas.add(Color(0.30, 0.32, 0.72, 1))
+            bw, bh = w * 0.52, h * 0.40
+            bx, by = x + (w - bw) / 2.0, y + (h - bh) / 2.0
+            cv.canvas.add(Line(rounded_rectangle=(bx, by, bw, bh, 4), width=1.2))
         return
+    if tex is not None:
+        return                       # 已有外部贴图，跳过程序内图案绘制
     if not (0 <= tile < KIND_COUNT):
         return
     suit = suit_of(tile)
@@ -319,10 +401,15 @@ class Board(Widget):
             return
         W, H, k = self._metrics()
         cv = self
-        cv.canvas.add(Color(*FELT))
-        cv.canvas.add(Rectangle(pos=(0, 0), size=(W, H)))
-        cv.canvas.add(Color(*FELT_DARK))
-        cv.canvas.add(Rectangle(pos=(0, H * 0.62), size=(W, H * 0.38)))
+        timg = load_tex("table")
+        if timg is not None:
+            cv.canvas.add(Color(1, 1, 1, 1))
+            cv.canvas.add(Rectangle(texture=timg.texture, pos=(0, 0), size=(W, H)))
+        else:
+            cv.canvas.add(Color(*FELT))
+            cv.canvas.add(Rectangle(pos=(0, 0), size=(W, H)))
+            cv.canvas.add(Color(*FELT_DARK))
+            cv.canvas.add(Rectangle(pos=(0, H * 0.62), size=(W, H * 0.38)))
 
         self._draw_topbar(W, H, k)
         self._draw_opponents(W, H, k)
@@ -332,8 +419,13 @@ class Board(Widget):
 
     def _draw_title(self):
         W, H, k = self._metrics()
-        self.canvas.add(Color(*FELT))
-        self.canvas.add(Rectangle(pos=(0, 0), size=(W, H)))
+        timg = load_tex("table")
+        if timg is not None:
+            self.canvas.add(Color(1, 1, 1, 1))
+            self.canvas.add(Rectangle(texture=timg.texture, pos=(0, 0), size=(W, H)))
+        else:
+            self.canvas.add(Color(*FELT))
+            self.canvas.add(Rectangle(pos=(0, 0), size=(W, H)))
         draw_text(self, W / 2.0, H * 0.60, "卡五星", H * 0.16, GOLD)
         draw_text(self, W / 2.0, H * 0.44, "正在准备牌局 ……", H * 0.05, DIM)
 
@@ -517,6 +609,7 @@ class KaWuXingApp(App):
     title = "KaWuXing"
 
     def build(self):
+        _init_sounds()
         self.board = Board(self)
         self.started = False
         self.engine = None
@@ -698,6 +791,7 @@ class KaWuXingApp(App):
                         break
                     if pick.type == ClaimType.HU:
                         eng.win_self_draw(seat, after_gang, hai_di)
+                        sfx("hu")
                         self.message = "%s 自摸！" % SEAT_LABEL[seat]
                         self.board.redraw()
                         yield 0.4
@@ -717,6 +811,7 @@ class KaWuXingApp(App):
                                         pick.tile, seat)
                                 if agreed:
                                     eng.win_by_discard(r, pick.tile, seat, True, False)
+                                    sfx("hu")
                                     self.message = "%s 抢杠胡 %s！" % (
                                         SEAT_LABEL[r], tile_name(pick.tile))
                                     self.board.redraw()
@@ -724,10 +819,12 @@ class KaWuXingApp(App):
                                     return
                             if not eng.apply_bu_gang(seat, pick.tile):
                                 break
+                            sfx("gang")
                             self.message = "%s 补杠 %s" % (
                                 SEAT_LABEL[seat], tile_name(pick.tile))
                         else:
                             eng.apply_an_gang(seat, pick.tile)
+                            sfx("gang")
                             self.message = "%s 暗杠" % SEAT_LABEL[seat]
                         self.board.redraw()
                         yield 0.35
@@ -760,6 +857,7 @@ class KaWuXingApp(App):
                 eng.declare_draw()
                 return
             eng.try_discard(seat, tile)
+            sfx("discard")
             if seat == HUMAN:
                 self.human_drawn = -1
                 self.selected = -1
@@ -794,17 +892,20 @@ class KaWuXingApp(App):
                 _, other, pick = responders[0]
                 if pick.type == ClaimType.HU:
                     eng.win_by_discard(other, tile, seat, False, gang_shang_pao)
+                    sfx("hu")
                     self.message = "%s 胡 %s！" % (SEAT_LABEL[other], tile_name(tile))
                     self.board.redraw()
                     yield 0.4
                     return
                 if pick.type == ClaimType.GANG:
                     eng.apply_ming_gang(other, tile)
+                    sfx("gang")
                     self.message = "%s 直杠 %s" % (SEAT_LABEL[other], tile_name(tile))
                     seat = other
                     need_draw = True
                 else:
                     eng.apply_peng(other, tile)
+                    sfx("peng")
                     self.message = "%s 碰 %s" % (SEAT_LABEL[other], tile_name(tile))
                     seat = other
                     need_draw = False
