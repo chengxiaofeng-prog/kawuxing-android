@@ -231,6 +231,8 @@ from kawuxing.engine import (                      # noqa: E402
 
 HUMAN = 0
 SEAT_LABEL = {0: "你", 1: "左家", 2: "右家"}
+SEAT_COLOR = {0: (0.95, 0.50, 0.10, 1), 1: (0.15, 0.47, 0.95, 1),
+              2: (0.70, 0.25, 0.85, 1)}   # 牌河描边：你 / 左家 / 右家
 
 _PENDING = object()          # 「等待玩家选择」的哨兵值
 
@@ -577,7 +579,6 @@ class Board(Widget):
         _trace("  opponents ok")
         self._draw_discards(W, H, k)
         _trace("  discards ok")
-        self._draw_human_discards(W, H, k)
         self._draw_hand(W, H, k)
         _trace("  hand ok")
         self._draw_info(W, H, k)
@@ -737,81 +738,41 @@ class Board(Widget):
         return uw, uw * 1.406
 
     def _draw_discards(self, W, H, k):
-        """两家的弃牌：左家一列、右家一列，各 4 张一行往下码。
+        """统一牌河：三家打出的牌按「出牌先后」排成一片，不再各摆各家门口。
 
-        牌张跟着手牌的放大比例一起放大（比例上限 1.5 倍）；
-        放不下的早牌收起、标「+N」；最新打出的那张加金框。
+        顺序就是引擎的 discard_log —— 从左到右、从上到下，最早的在左上，
+        最新一张在末尾并加金框；每张牌用座位色描边标是谁打的。
+        牌与手牌同尺寸；摆不下的早牌收起，牌河上方标「更早 N 张已收起」。
         """
         eng = self.app.engine
-        uw, _uh = self._tile_unit(W, H, k)
-        s = min(1.5, uw / (64.0 * k))
-        tw, th = 30 * k * s, 42 * k * s
-        per = 4                                    # 每行 4 张，窄条给中间让出地方
-        step = th + 5 * k
-        y0 = H * 0.56                              # 第一行（最早打出的）
-        rows = max(2, int((y0 - 168 * k) / step) + 1)
-        for seat in (1, 2):
-            left = (seat == 1)
-            d = eng.players[seat].discards
-            newest = len(d) - 1 if eng.last_discard_seat == seat else -1
-            for i, t in enumerate(d):
-                row, col = divmod(i, per)
-                if row >= rows:
-                    break
-                if left:
-                    x = W * 0.03 + col * (tw + 4 * k)
-                else:
-                    x = W - W * 0.03 - (col + 1) * (tw + 4 * k)
-                y = y0 - row * step
-                draw_tile(self, x, y, tw, th, t)
-                if i == newest:
-                    self.canvas.add(Color(*GOLD))
-                    self.canvas.add(Line(rounded_rectangle=(
-                        x - 1.5, y - 1.5, tw + 3, th + 3, 5), width=2.0))
-            over = len(d) - rows * per
-            if over > 0:
-                last_row = (min(len(d), rows * per) - 1) // per
-                tx = (W * 0.03 + per * (tw + 4 * k) + 6 * k) if left else \
-                     (W - W * 0.03 - per * (tw + 4 * k) - 6 * k)
-                draw_text(self, tx, y0 - last_row * step + th * 0.5,
-                          "+%d" % over, 15 * k, DIM,
-                          anchor=("l" if left else "r"))
-
-    def _draw_human_discards(self, W, H, k):
-        """自己的弃牌：**和手牌同尺寸**（与桌面版同一口径：牌河里的牌与手牌同尺寸）。
-
-        之前只画左右两家的牌河，自己打出去的牌在桌面上根本看不到；
-        现在摆在自己手牌上方，最新的一张加金框，放不下的早牌收起并标「+N」。
-        """
-        eng = self.app.engine
-        d = eng.players[HUMAN].discards
-        if not d:
+        log = getattr(eng, "discard_log", None) or []
+        if not log:
             return
         uw, uh = self._tile_unit(W, H, k)
         gap = uw * 0.025
-        # 左右两边要留给对家的牌河（各 4 张宽），中间才是自己的
-        opp_w = 4 * (30 * k * min(1.5, uw / (64.0 * k)) + 4 * k)
-        span = (W - W * 0.06 - 2 * opp_w - 16 * k)
-        per = max(4, int(span / (uw + gap)))
-        rows = max(1, min(2, int(((H * 0.72 - 8 * k) - 244 * k) / (uh + 5 * k))))
-        total_w = per * (uw + gap)
-        bx = W * 0.5 - total_w / 2.0
-        newest = len(d) - 1 if eng.last_discard_seat == HUMAN else -1
-        for i, t in enumerate(d):
+        top = H * 0.72 - 8 * k
+        per = max(4, int((W * 0.96 + gap) / (uw + gap)))
+        rows = max(1, min(2, int((top - 244 * k + 5 * k) / (uh + 5 * k))))
+        cap = per * rows
+        items = log[-cap:]                       # 只摆得下最近的这么多张
+        over = len(log) - len(items)
+        grid_w = per * (uw + gap) - gap
+        bx = W * 0.5 - grid_w / 2.0
+        for i, (seat, t) in enumerate(items):
             r, c = divmod(i, per)
-            if r >= rows:
-                break
             x = bx + c * (uw + gap)
-            y = 244 * k + r * (uh + 5 * k)       # 最早的牌在最下面，往上码
+            y = top - (r + 1) * uh - r * 5 * k
             draw_tile(self, x, y, uw, uh, t)
-            if i == newest:                      # 自己刚打的那张金框
+            self.canvas.add(Color(*SEAT_COLOR.get(seat, DIM)))
+            self.canvas.add(Line(rounded_rectangle=(x - 1, y - 1, uw + 2, uh + 2, 5),
+                                 width=2.4))
+            if i == len(items) - 1:              # 最新打出的一张
                 self.canvas.add(Color(*GOLD))
                 self.canvas.add(Line(rounded_rectangle=(
-                    x - 2, y - 2, uw + 4, uh + 4, 7), width=2.4))
-        over = len(d) - rows * per               # 放不下的早牌收起，标个数
+                    x - 2.5, y - 2.5, uw + 5, uh + 5, 7), width=2.4))
         if over > 0:
-            draw_text(self, W * 0.5, 244 * k + rows * (uh + 5 * k) + 14 * k,
-                      "+%d 张更早的已收起" % over, 15 * k, DIM)
+            draw_text(self, W * 0.98, top + 4 * k,
+                      "更早 %d 张已收起" % over, 13 * k, DIM, anchor="r")
 
     def _draw_hand(self, W, H, k):
         app = self.app

@@ -64,6 +64,7 @@ class GameEngine(object):
         self.last_drawn_tile = -1
         self.last_discard_tile = -1
         self.last_discard_seat = -1
+        self.discard_log = []          # 全局牌河：(seat, tile)，按出牌先后
         self.last_action_was_gang = False
         self.last_gang_seat = -1
         self.round_over = False
@@ -83,6 +84,7 @@ class GameEngine(object):
         self.last_gang_seat = -1
         self.last_discard_tile = -1
         self.last_discard_seat = -1
+        self.discard_log = []          # 全局牌河：(seat, tile)，按出牌先后
 
         self.dealer_seat = dealer_seat % SEAT_COUNT
         self.current_seat = self.dealer_seat
@@ -143,6 +145,7 @@ class GameEngine(object):
                 return False
             tile = p.hand.pop()
         p.discards.append(tile)
+        self.discard_log.append((seat, tile))
         self.last_discard_tile = tile
         self.last_discard_seat = seat
         return True
@@ -343,6 +346,11 @@ class GameEngine(object):
         for i in range(len(d) - 1, -1, -1):
             if d[i] == tile:
                 d.pop(i)
+                break
+        # 牌河（全局顺序）里也要同步拿掉这张，否则碰/杠之后牌河会留一张幽灵牌
+        for i in range(len(self.discard_log) - 1, -1, -1):
+            if self.discard_log[i] == (seat, tile):
+                self.discard_log.pop(i)
                 return
 
     def mark_gang(self, seat):
@@ -565,6 +573,17 @@ class SimpleAi(object):
 
         visible = engine.visible_counts(seat)
         candidates = self._distinct(p.hand)
+
+        # 有人亮倒：绝不打出「他会胡的牌」—— 亮倒者点炮胡是 ×2，
+        # 送一张等于直接送分。只有一张安全牌都不剩时，才被迫从原候选里挑。
+        liang = [s for s in range(SEAT_COUNT)
+                 if s != seat and engine.players[s].liang_dao]
+        if liang:
+            safe = [t for t in candidates
+                    if not any(engine.can_hu_on_discard(s, t, seat, False)
+                               for s in liang)]
+            if safe:
+                candidates = safe
 
         best_tile = candidates[0]
         best_shanten = 1 << 30
