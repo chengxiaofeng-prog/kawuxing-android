@@ -334,6 +334,40 @@ def sfx(name):
         pass
 
 
+_tile_sounds = {}                     # tile -> Sound 或 None（第一次用到才加载）
+
+
+def _play_tile_voice(tile):
+    """播报一张牌的名字（「五筒」「红中」…）。"""
+    s = _tile_sounds.get(tile, 0)
+    if s == 0:                        # 还没加载过
+        path = os.path.join(_SND_DIR, "tiles", "t%02d.wav" % tile)
+        s = None
+        if os.path.exists(path):
+            try:
+                s = SoundLoader.load(path)
+            except Exception:
+                s = None
+        _tile_sounds[tile] = s
+    if s is None:
+        return
+    try:
+        s.stop()                      # 同一张牌连着打，从头再播
+    except Exception:
+        pass
+    try:
+        s.play()
+    except Exception:
+        pass
+
+
+def say_tile(tile, delay=0.16):
+    """报牌：稍微延后一点，让「木牌落桌」的响声先出来。"""
+    if tile is None or tile < 0:
+        return
+    Clock.schedule_once(lambda dt: _play_tile_voice(tile), delay)
+
+
 _FONT = None
 
 
@@ -680,14 +714,26 @@ class Board(Widget):
             tx = x0 if left else W - W * 0.03
             draw_text(self, tx, y0, "%s（庄）" % SEAT_LABEL[seat] if p.is_dealer
                       else SEAT_LABEL[seat], 20 * k, DIM, anchor=anchor)
-            # 手牌牌背
+            # 手牌：平时是牌背；胡牌结算后三家都倒牌，正面摊给所有人看
+            face = self.app.reveal_all
+            hand = p.hand
+            if face and eng.last_hu is not None and eng.last_hu.winner_seat == seat:
+                # 胡牌者用快照（含点炮那张），牌型看得更完整
+                hand = list(eng.last_hu.hand_snapshot) or hand
+            n = len(hand)
             tw, th = 20 * k, 28 * k
-            n = len(p.hand)
-            row_w = n * (tw + 2 * k)
+            gap = 2 * k
+            if face:
+                # 倒牌时把牌放大到单侧可行的最大尺寸，否则小牌看不清字
+                avail = W * 0.46
+                if n:
+                    tw = min(46 * k, max(20 * k, avail / float(n) - 2 * k))
+                    th = tw * 1.4
+            row_w = n * (tw + gap)
             bx = x0 if left else W - W * 0.03 - row_w
             for i in range(n):
-                draw_tile(self, bx + i * (tw + 2 * k), y0 - 40 * k, tw, th,
-                          0, back=True)
+                draw_tile(self, bx + i * (tw + gap), y0 - 40 * k, tw, th,
+                          hand[i] if face else 0, back=not face)
             # 副露
             my = y0 - 78 * k
             mw = 26 * k
@@ -711,9 +757,6 @@ class Board(Widget):
             if p.liang_dao and not eng.round_over:
                 draw_text(self, tx, my - 8 * k, "已亮倒 ×2", 17 * k, GOLD,
                           anchor=anchor)
-            if self.app.reveal_all and p.hand:
-                txt = " ".join(tile_name(t) for t in p.hand)
-                draw_text(self, tx, my - 60 * k, txt, 16 * k, DIM, anchor=anchor)
 
     def _tile_unit(self, W, H, k):
         """底部一组牌的统一「牌宽」：手牌按 1.5 倍目标放大，装不下就收到刚好铺满。
@@ -1148,6 +1191,7 @@ class KaWuXingApp(App):
             eng.try_discard(seat, tile)
             _trace("discard seat=%d tile=%s" % (seat, tile_name(tile)))
             sfx("discard")
+            say_tile(tile)                    # 报出牌面（「五筒」…）
             if seat == HUMAN:
                 self.human_drawn = -1
                 self.selected = -1
@@ -1162,7 +1206,8 @@ class KaWuXingApp(App):
 
             responders = []
             for kk in (1, 2):
-                other = (seat + kk) % SEAT_COUNT
+                # 逆时针轮转：先问「下家」= 出牌者的顺时针下一位
+                other = (seat - kk) % SEAT_COUNT
                 opts = eng.get_claim_options(other, tile, seat, gang_shang_pao)
                 # 亮倒的人不能碰：碰会拆散已经听牌的手牌，亮倒就失去意义
                 #（电脑托管和玩家手动走同一条过滤，口径一致）
@@ -1206,7 +1251,8 @@ class KaWuXingApp(App):
                 yield 0.35
                 continue
 
-            seat = (seat + 1) % SEAT_COUNT
+            # 逆时针轮转：左家(1) → 你(0) → 右家(2) → 左家(1)…
+            seat = (seat - 1) % SEAT_COUNT
             need_draw = True
 
         if not eng.round_over:

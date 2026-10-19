@@ -3,11 +3,11 @@
 title = KaWuXing
 package.name = kawuxing
 package.domain = org.kawuxing
-package.version = 1.4.0
+package.version = 1.5.0
 
 # buildozer 1.5 起强制要求 [app] version 或 version.regex 二者之一，
 # 只写 package.version 会报 "One of "version" or "version.regex" must be set"
-version = 1.4.0
+version = 1.5.0
 
 # ★ python-for-android 固定到官方正式版（2026-05-09）。
 #   默认是跟 master 走 —— 上游随时会变，同一份配置今天能过、明天就挂。
